@@ -77,14 +77,6 @@ def init_db():
             updated_at TEXT
         )
     """)
-    c.execute("""
-        CREATE TABLE IF NOT EXISTS user_profile (
-            id INTEGER PRIMARY KEY,
-            monthly_budget TEXT,
-            preferred_redemption TEXT,
-            updated_at TEXT
-        )
-    """)
     conn.commit()
     conn.close()
 
@@ -560,9 +552,8 @@ def page_import():
     if uploaded_file:
         try:
             data = json.load(uploaded_file)
-            st.json(data)  # 预览
+            st.json(data)
             if st.button("确认导入并合并", type="primary"):
-                # 导入卡片
                 if "cards" in data:
                     for card in data["cards"]:
                         exists = df_from_query("SELECT id FROM cards WHERE bank=? AND card_name=?", 
@@ -577,7 +568,6 @@ def page_import():
                                  0.01, card.get("benefits", ""), now, now)
                             )
                 
-                # 导入活动（简化映射）
                 if "promos" in data:
                     count = 0
                     for promo in data["promos"]:
@@ -618,7 +608,6 @@ def page_analysis():
                 st.subheader(f"📄 {f.name}")
                 st.dataframe(df.head(10), use_container_width=True)
                 
-                # 简单分析示例
                 if "金额" in df.columns or "price" in df.columns or "amount" in df.columns:
                     col_name = [c for c in df.columns if c in ["金额", "price", "amount", "消费金额"]][0]
                     total = df[col_name].sum()
@@ -628,7 +617,6 @@ def page_analysis():
         
         if all_data:
             st.success(f"成功加载 {len(all_data)} 个文件")
-            st.info("💡 提示：后续可扩展自动按商户匹配最优信用卡、生成月度消费报告等功能。")
 
 def page_notifications():
     st.header("🔔 活动到期提醒")
@@ -638,13 +626,10 @@ def page_notifications():
         st.info("暂没有活动数据")
         return
     
-    # 转换为日期
     promos = promos.copy()
     promos["end_date_dt"] = pd.to_datetime(promos["end_date"], errors="coerce")
     
-    # 最近 3 天
     soon = promos[promos["end_date_dt"] <= (datetime.now() + timedelta(days=3))]
-    # 本周到期
     week = promos[(promos["end_date_dt"] <= (datetime.now() + timedelta(days=7))) & (promos["end_date_dt"] > (datetime.now() + timedelta(days=3)))]
     
     if not soon.empty:
@@ -696,12 +681,9 @@ def page_export():
                                "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
         else:
             st.info("暂无活动")
-    
-    st.markdown("---")
-    st.write(f"本地数据库路径：`{os.path.abspath(DB_PATH)}`")
 
 def page_help():
-    st.header("使用说明与部署")
+    st.header("使用说明")
     st.markdown("""
 ### 功能说明
 - **截图解析**：上传手机银行截图，自动提取活动信息

@@ -77,6 +77,14 @@ def init_db():
             updated_at TEXT
         )
     """)
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS user_profile (
+            id INTEGER PRIMARY KEY,
+            monthly_budget TEXT,
+            preferred_redemption TEXT,
+            updated_at TEXT
+        )
+    """)
     conn.commit()
     conn.close()
 
@@ -107,9 +115,8 @@ def get_promos_df(active_only=True):
     sql += " ORDER BY end_date DESC, bank"
     return df_from_query(sql)
 
-# ==================== 大模型配置（优先 Secrets） ====================
+# ==================== 大模型配置 ====================
 def get_llm_config():
-    # 优先从 Streamlit Secrets 读取（云端推荐）
     api_key = st.secrets.get("OPENAI_API_KEY", "")
     base_url = st.secrets.get("OPENAI_BASE_URL", "https://api.openai.com/v1")
     model = st.secrets.get("OPENAI_MODEL", "gpt-4o")
@@ -331,7 +338,7 @@ def recommend_flexible(cards_df: pd.DataFrame, promos_df: pd.DataFrame) -> Dict:
         "弹性策略建议": suggestions
     }
 
-# ==================== 页面 ====================
+# ==================== 页面函数 ====================
 def page_dashboard():
     st.header("📊 仪表盘")
     cards = get_cards_df()
@@ -403,8 +410,7 @@ def page_promotions():
     
     api_key, base_url, model = get_llm_config()
     
-    # 如果 secrets 没有配置，允许手动输入
-    with st.sidebar.expander("🔑 API 配置（Secrets 优先）", expanded=not bool(api_key)):
+    with st.sidebar.expander("🔑 API 配置", expanded=not bool(api_key)):
         if not api_key:
             api_key = st.text_input("API Key", type="password")
             base_url = st.text_input("Base URL", value=base_url)
@@ -443,7 +449,6 @@ def page_promotions():
                     st.session_state["parsed_promo"] = data
                     st.json(data)
         
-        # 表单
         parsed = st.session_state.get("parsed_promo", {})
         with st.form("promo_form"):
             col1, col2 = st.columns(2)
@@ -547,6 +552,113 @@ def page_recommend():
         for s in flex["弹性策略建议"]:
             st.markdown(f"- {s}")
 
+def page_import():
+    st.header("📥 数据导入（从 HTML 版或备份恢复）")
+    st.info("上传之前从 HTML 版导出的 JSON 文件，将自动合并卡片和活动数据（去重）。")
+    
+    uploaded_file = st.file_uploader("选择 JSON 备份文件", type=["json"])
+    if uploaded_file:
+        try:
+            data = json.load(uploaded_file)
+            st.json(data)  # 预览
+            if st.button("确认导入并合并", type="primary"):
+                # 导入卡片
+                if "cards" in data:
+                    for card in data["cards"]:
+                        exists = df_from_query("SELECT id FROM cards WHERE bank=? AND card_name=?", 
+                                             (card.get("bank", ""), card.get("name", "")))
+                        if exists.empty:
+                            now = datetime.now().isoformat()
+                            execute_sql(
+                                """INSERT INTO cards (bank, card_name, last4, annual_fee, fee_waiver, main_categories, points_value, notes, created_at, updated_at)
+                                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                                (card.get("bank", ""), card.get("name", ""), "", 
+                                 card.get("feeAnnual", 0), "", json.dumps([], ensure_ascii=False),
+                                 0.01, card.get("benefits", ""), now, now)
+                            )
+                
+                # 导入活动（简化映射）
+                if "promos" in data:
+                    count = 0
+                    for promo in data["promos"]:
+                        exists = df_from_query("SELECT id FROM promotions WHERE title=? AND bank=?", 
+                                             (promo.get("name", ""), promo.get("bank", "")))
+                        if exists.empty:
+                            now = datetime.now().isoformat()
+                            type_map = {"discount": "立减", "fullReduction": "立减", "cashback": "返现", "points": "积分倍率", "gift": "其他"}
+                            execute_sql(
+                                """INSERT INTO promotions (bank, card_name, title, category, rebate_type, rebate_value, max_rebate, min_spend, start_date, end_date, conditions, source, is_active, created_at, updated_at)
+                                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?)""",
+                                (promo.get("bank", ""), "", promo.get("name", ""), 
+                                 promo.get("category", "其他"), type_map.get(promo.get("type", ""), "其他"),
+                                 promo.get("value", 0), promo.get("max", 0), 0,
+                                 date.today().isoformat(), promo.get("expiry", ""), 
+                                 promo.get("merchant", ""), "JSON导入", now, now)
+                            )
+                            count += 1
+                    st.success(f"导入完成！新增 {count} 个活动")
+                else:
+                    st.success("卡片/数据导入完成！")
+                st.rerun()
+        except Exception as e:
+            st.error(f"导入失败: {e}")
+
+def page_analysis():
+    st.header("📈 消费账单分析")
+    st.info("上传支付宝/微信/银行账单 CSV 文件，自动分析消费结构并匹配最优卡片建议。")
+    
+    uploaded_files = st.file_uploader("上传账单 CSV（支持多文件）", type=["csv"], accept_multiple_files=True)
+    
+    if uploaded_files:
+        all_data = []
+        for f in uploaded_files:
+            try:
+                df = pd.read_csv(f, encoding="utf-8")
+                all_data.append(df)
+                st.subheader(f"📄 {f.name}")
+                st.dataframe(df.head(10), use_container_width=True)
+                
+                # 简单分析示例
+                if "金额" in df.columns or "price" in df.columns or "amount" in df.columns:
+                    col_name = [c for c in df.columns if c in ["金额", "price", "amount", "消费金额"]][0]
+                    total = df[col_name].sum()
+                    st.metric("总消费", f"¥{total:,.2f}")
+            except Exception as e:
+                st.error(f"读取 {f.name} 失败: {e}")
+        
+        if all_data:
+            st.success(f"成功加载 {len(all_data)} 个文件")
+            st.info("💡 提示：后续可扩展自动按商户匹配最优信用卡、生成月度消费报告等功能。")
+
+def page_notifications():
+    st.header("🔔 活动到期提醒")
+    promos = get_promos_df()
+    
+    if promos.empty:
+        st.info("暂没有活动数据")
+        return
+    
+    # 转换为日期
+    promos = promos.copy()
+    promos["end_date_dt"] = pd.to_datetime(promos["end_date"], errors="coerce")
+    
+    # 最近 3 天
+    soon = promos[promos["end_date_dt"] <= (datetime.now() + timedelta(days=3))]
+    # 本周到期
+    week = promos[(promos["end_date_dt"] <= (datetime.now() + timedelta(days=7))) & (promos["end_date_dt"] > (datetime.now() + timedelta(days=3)))]
+    
+    if not soon.empty:
+        st.error(f"⚠️ **紧急：{len(soon)} 个活动将在 3 天内到期！**")
+        st.dataframe(soon[["bank", "title", "end_date", "conditions"]], use_container_width=True)
+    
+    if not week.empty:
+        st.warning(f"📅 本周还有 {len(week)} 个活动即将到期")
+        with st.expander("查看本周到期活动"):
+            st.dataframe(week[["bank", "title", "end_date", "conditions"]], use_container_width=True)
+    
+    if soon.empty and week.empty:
+        st.success("✅ 近期没有即将到期的活动")
+
 def page_export():
     st.header("📤 导出备份")
     st.info("Streamlit Cloud 免费版重启后数据会丢失，请定期导出备份！")
@@ -555,7 +667,9 @@ def page_export():
     promos = get_promos_df(active_only=False)
     
     col1, col2 = st.columns(2)
+    
     with col1:
+        st.subheader("卡片数据")
         if not cards.empty:
             export_cards = cards.copy()
             if "main_categories" in export_cards.columns:
@@ -568,7 +682,11 @@ def page_export():
             st.download_button("下载卡片 Excel", buffer.getvalue(),
                                f"cards_{datetime.now().strftime('%Y%m%d')}.xlsx",
                                "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+        else:
+            st.info("暂无卡片")
+    
     with col2:
+        st.subheader("活动数据")
         if not promos.empty:
             buffer2 = BytesIO()
             with pd.ExcelWriter(buffer2, engine="openpyxl") as writer:
@@ -576,24 +694,31 @@ def page_export():
             st.download_button("下载活动 Excel", buffer2.getvalue(),
                                f"promos_{datetime.now().strftime('%Y%m%d')}.xlsx",
                                "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+        else:
+            st.info("暂无活动")
+    
+    st.markdown("---")
+    st.write(f"本地数据库路径：`{os.path.abspath(DB_PATH)}`")
 
 def page_help():
-    st.header("使用说明")
+    st.header("使用说明与部署")
     st.markdown("""
-### 部署后如何使用
-1. 在 Streamlit Cloud 的 Secrets 里配置 API Key
-2. 添加你的信用卡
-3. 上传手机银行优惠截图进行解析
-4. 使用智能推荐
-5. **定期导出 Excel 备份**（很重要！）
+### 功能说明
+- **截图解析**：上传手机银行截图，自动提取活动信息
+- **智能推荐**：详细模式（精确匹配）和弹性模式（策略建议）
+- **数据互通**：支持从 HTML 版导入 JSON 数据
+- **账单分析**：上传 CSV 账单文件进行分析
+- **活动提醒**：查看即将到期活动
 
-### 推荐模型
-- gpt-4o
-- 通义千问 VL
-- 智谱 GLM-4V
-- 其他支持视觉的 OpenAI 兼容模型
+### 部署
+已部署到 Streamlit Cloud，数据存储在临时空间，请定期导出备份。
+
+### 隐私
+- 截图请脱敏后再上传
+- API Key 存储在 Streamlit Secrets，不会公开
     """)
 
+# ==================== 主程序 ====================
 def main():
     st.sidebar.title("💳 CreditTool")
     st.sidebar.caption("信用卡效益最大化助手")
@@ -603,6 +728,9 @@ def main():
         "💳 我的卡片": page_cards,
         "🎯 优惠活动": page_promotions,
         "🧠 智能推荐": page_recommend,
+        "📥 数据导入": page_import,
+        "📈 账单分析": page_analysis,
+        "🔔 活动提醒": page_notifications,
         "📤 导出备份": page_export,
         "📖 使用说明": page_help,
     }
